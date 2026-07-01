@@ -1,0 +1,6 @@
+{
+  "name": "GxPilot",
+  "description": "AI agent using GXP guidance data to automate GxP document preparation, review, and compliance prediction for pharmaceuticals.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

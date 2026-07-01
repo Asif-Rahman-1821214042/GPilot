@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "GxPilot PostgreSQL",
+      "Group": "Servers",
+      "Host": "pgdb",
+      "Port": 5432,
+      "MaintenanceDB": "gxpilot",
+      "Username": "gxpilot",
+      "Password": "gxpilot_password",
+      "SSLMode": "prefer"
+    }
+  }
+}
