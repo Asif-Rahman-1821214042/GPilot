@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { 
   ShieldCheck, FileText, FileSpreadsheet, MessageSquareCode, 
-  TrendingUp, Sparkles, RefreshCw, AlertCircle, HelpCircle
+  TrendingUp, Sparkles, RefreshCw, AlertCircle, HelpCircle, LogOut, Library
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { Document } from "./types";
@@ -12,12 +12,63 @@ import SOPPreparer from "./components/SOPPreparer";
 import APQRCompiler from "./components/APQRCompiler";
 import ComplianceInspector from "./components/ComplianceInspector";
 import RoiTracker from "./components/RoiTracker";
+import AuthPage from "./components/AuthPage";
+import ControlBankView from "./components/ControlBankView";
+
+type AuthUser = {
+  id: string;
+  name: string;
+  staff_id: string;
+  designation: string;
+  type: string;
+};
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"desk" | "sop" | "apqr" | "roi">("desk");
+  const [activeTab, setActiveTab] = useState<"desk" | "sop" | "apqr" | "bank" | "roi">("desk");
   const [documents, setDocuments] = useState<Document[]>([]);
   const [selectedDocument, setSelectedDocument] = useState<Document | null>(null);
+  const [selectedDocumentMode, setSelectedDocumentMode] = useState<"private" | "bank">("private");
   const [isLoadingDocs, setIsLoadingDocs] = useState(false);
+  const [authToken, setAuthToken] = useState(() => localStorage.getItem("gxpilot_token") || "");
+  const [authUser, setAuthUser] = useState<AuthUser | null>(() => {
+    const storedUser = localStorage.getItem("gxpilot_user");
+    return storedUser ? JSON.parse(storedUser) : null;
+  });
+
+  useEffect(() => {
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = (input, init = {}) => {
+      const token = localStorage.getItem("gxpilot_token");
+      const headers = new Headers(init.headers);
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (token && url.startsWith("/api") && !url.startsWith("/api/auth")) {
+        headers.set("Authorization", `Bearer ${token}`);
+      }
+      return originalFetch(input, { ...init, headers });
+    };
+
+    return () => {
+      window.fetch = originalFetch;
+    };
+  }, []);
+
+  const handleAuthenticated = (token: string, user: AuthUser) => {
+    localStorage.setItem("gxpilot_token", token);
+    localStorage.setItem("gxpilot_user", JSON.stringify(user));
+    setAuthToken(token);
+    setAuthUser(user);
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem("gxpilot_token");
+    localStorage.removeItem("gxpilot_user");
+    setAuthToken("");
+    setAuthUser(null);
+    setDocuments([]);
+    setSelectedDocument(null);
+    setSelectedDocumentMode("private");
+    setActiveTab("desk");
+  };
 
   // Fetch documents list from Python backend
   const fetchDocuments = async () => {
@@ -49,8 +100,10 @@ export default function App() {
   };
 
   useEffect(() => {
-    fetchDocuments();
-  }, [activeTab]);
+    if (authToken) {
+      fetchDocuments();
+    }
+  }, [activeTab, authToken]);
 
   const handleDeleteDocument = async (id: string) => {
     try {
@@ -61,6 +114,7 @@ export default function App() {
         setDocuments(documents.filter(d => d.id !== id));
         if (selectedDocument?.id === id) {
           setSelectedDocument(null);
+          setSelectedDocumentMode("private");
         }
       }
     } catch (err) {
@@ -74,12 +128,15 @@ export default function App() {
       const response = await fetch(`/api/documents/${doc.id}`);
       if (response.ok) {
         const fullDoc = await response.json();
+        setSelectedDocumentMode("private");
         setSelectedDocument(fullDoc);
       } else {
+        setSelectedDocumentMode("private");
         setSelectedDocument(doc);
       }
     } catch (err) {
       console.error(err);
+      setSelectedDocumentMode("private");
       setSelectedDocument(doc);
     }
   };
@@ -89,10 +146,17 @@ export default function App() {
       return (
         <ComplianceInspector
           document={selectedDocument}
-          onBack={() => setSelectedDocument(null)}
+          onBack={() => {
+            setSelectedDocument(null);
+            setSelectedDocumentMode("private");
+          }}
           onActionComplete={() => {
             fetchDocuments();
           }}
+          readOnly={selectedDocumentMode === "bank"}
+          backLabel={selectedDocumentMode === "bank" ? "Back to All SOP/APQR" : "Back to Document Desk"}
+          allowReviewActions={selectedDocumentMode === "bank"}
+          actionBasePath={selectedDocumentMode === "bank" ? "/api/control-bank/documents" : "/api/documents"}
         />
       );
     }
@@ -118,6 +182,7 @@ export default function App() {
             onDeleteDocument={handleDeleteDocument}
             onNavigate={(tab) => {
               setSelectedDocument(null);
+              setSelectedDocumentMode("private");
               setActiveTab(tab);
             }}
           />
@@ -130,7 +195,7 @@ export default function App() {
             }}
           />
         );
-      case "apqr":
+        case "apqr":
         return (
           <APQRCompiler
             onDraftGenerated={() => {
@@ -138,10 +203,23 @@ export default function App() {
             }}
           />
         );
+      case "bank":
+        return (
+          <ControlBankView
+            onSelectDocument={(doc) => {
+              setSelectedDocumentMode("bank");
+              setSelectedDocument(doc);
+            }}
+          />
+        );
       case "roi":
         return <RoiTracker />;
     }
   };
+
+  if (!authToken || !authUser) {
+    return <AuthPage onAuthenticated={handleAuthenticated} />;
+  }
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col font-sans">
@@ -155,7 +233,7 @@ export default function App() {
                 G
               </div>
               <div>
-                <span className="font-bold tracking-tight text-slate-800 text-lg underline decoration-blue-600 decoration-2 underline-offset-4 cursor-pointer" onClick={() => { setSelectedDocument(null); setActiveTab("desk"); }}>
+                <span className="font-bold tracking-tight text-slate-800 text-lg underline decoration-blue-600 decoration-2 underline-offset-4 cursor-pointer" onClick={() => { setSelectedDocument(null); setSelectedDocumentMode("private"); setActiveTab("desk"); }}>
                   GxPilot<span className="text-blue-600 font-extrabold font-mono">.ai</span>
                 </span>
                 <span className="ml-3.5 hidden sm:inline-block px-2.5 py-0.5 bg-slate-100 text-slate-500 text-[10px] font-mono font-bold rounded border border-slate-200 uppercase tracking-widest">
@@ -167,7 +245,7 @@ export default function App() {
             {/* Navigation Tabs */}
             <nav className="flex space-x-1 bg-slate-100/80 p-1 rounded-xl border border-slate-200/60">
               <button
-                onClick={() => { setSelectedDocument(null); setActiveTab("desk"); }}
+                onClick={() => { setSelectedDocument(null); setSelectedDocumentMode("private"); setActiveTab("desk"); }}
                 className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer ${
                   activeTab === "desk" && !selectedDocument
                     ? "bg-white text-blue-700 shadow-xs border border-slate-200"
@@ -178,7 +256,7 @@ export default function App() {
                 Compliance Desk
               </button>
               <button
-                onClick={() => { setSelectedDocument(null); setActiveTab("sop"); }}
+                onClick={() => { setSelectedDocument(null); setSelectedDocumentMode("private"); setActiveTab("sop"); }}
                 className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer ${
                   activeTab === "sop" && !selectedDocument
                     ? "bg-white text-blue-700 shadow-xs border border-slate-200"
@@ -189,7 +267,7 @@ export default function App() {
                 SOP Preparer
               </button>
               <button
-                onClick={() => { setSelectedDocument(null); setActiveTab("apqr"); }}
+                onClick={() => { setSelectedDocument(null); setSelectedDocumentMode("private"); setActiveTab("apqr"); }}
                 className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer ${
                   activeTab === "apqr" && !selectedDocument
                     ? "bg-white text-blue-700 shadow-xs border border-slate-200"
@@ -200,7 +278,7 @@ export default function App() {
                 APQR Compiler
               </button>
               <button
-                onClick={() => { setSelectedDocument(null); setActiveTab("roi"); }}
+                onClick={() => { setSelectedDocument(null); setSelectedDocumentMode("private"); setActiveTab("roi"); }}
                 className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer ${
                   activeTab === "roi" && !selectedDocument
                     ? "bg-white text-blue-700 shadow-xs border border-slate-200"
@@ -209,6 +287,17 @@ export default function App() {
               >
                 <TrendingUp className="h-3.5 w-3.5" />
                 ROI Insights
+              </button>
+              <button
+                onClick={() => { setSelectedDocument(null); setSelectedDocumentMode("private"); setActiveTab("bank"); }}
+                className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer ${
+                  activeTab === "bank" && !selectedDocument
+                    ? "bg-white text-blue-700 shadow-xs border border-slate-200"
+                    : "text-slate-600 hover:text-slate-900 hover:bg-slate-50"
+                }`}
+              >
+                <Library className="h-3.5 w-3.5" />
+                All SOP/APQR
               </button>
             </nav>
 
@@ -228,6 +317,17 @@ export default function App() {
                 title="Refresh datasets"
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${isLoadingDocs ? "animate-spin" : ""}`} />
+              </button>
+              <div className="hidden lg:block text-right">
+                <p className="text-xs font-bold text-slate-700 leading-none">{authUser.name}</p>
+                <p className="text-[10px] text-slate-400 font-mono mt-1">{authUser.designation}</p>
+              </div>
+              <button
+                onClick={handleLogout}
+                className="p-2 text-slate-400 hover:text-red-600 rounded-lg border border-slate-200 bg-white shadow-3xs hover:bg-red-50 transition-all cursor-pointer"
+                title="Logout"
+              >
+                <LogOut className="h-3.5 w-3.5" />
               </button>
             </div>
           </div>

@@ -135,6 +135,11 @@ def analyze_gxp_document(name: str, doc_type: str, content: str) -> Dict[str, An
         "If the file name or document content clearly indicates a Draft or Under Review document, treat pending approval names, signatures, "
         "and approval dates as finalization items rather than major technical APQR/SOP content failures; flag them as Low severity unless the "
         "document is presented as Approved or final. "
+        "For draft SOPs, controlled [TBD] placeholders are acceptable where the author did not provide site-specific IDs, owner names, dates, "
+        "forms, product families, or validated numerical tolerances. Do not assign High or Medium severity solely because a draft contains "
+        "[TBD] placeholders, provided the SOP clearly identifies the required control and what must be finalized. "
+        "When a draft SOP contains all core SOP sections, role accountability, procedural steps, records, deviation handling, data integrity, "
+        "training, and references, its score should generally remain in the 85-95 range even if low-severity finalization placeholders remain. "
         f"{audit_profile['focus']}"
     )
     
@@ -273,10 +278,16 @@ def draft_gxp_sop(title: str, steps: str, roles: str, regulations: List[str]) ->
     - required record/evidence
     - critical parameter or acceptance criterion when applicable
     - what to do if the criterion is not met
+    If the title or process description includes operation, disassembly, cleaning, line clearance, equipment status, or post-use controls,
+    include explicit subsections for each applicable workflow. For cleaning/disassembly, include safe shutdown/LOTO verification,
+    disassembly sequence, gross residue removal, approved cleaning agent [TBD if not supplied], contact time [TBD if not supplied],
+    rinse/wipe expectations, visual cleanliness acceptance criteria, reassembly/readiness status, labeling, QA/QC verification,
+    and required cleaning log entries. Do not omit a named workflow just because the user gave only summary steps.
 
     ## 7. Critical Process Parameters and Acceptance Criteria
     Include a table with Parameter, Target/Limit, Monitoring Method, Frequency, Responsible Role, Action if Out of Limit.
-    Use [TBD] rather than making up values not provided.
+    When the user supplies an exact value, use it as the target and define a controlled draft limit such as "target value; validated tolerance to be confirmed by site protocol" instead of leaving the criterion blank.
+    Use [TBD] only for values that are not present in the input and cannot be responsibly inferred.
 
     ## 8. Deviations, OOS/OOT, and CAPA Handling
     Explain when to stop work, quarantine product/equipment, notify QA, open deviation/OOS/OOT, assess impact, and initiate CAPA.
@@ -298,7 +309,7 @@ def draft_gxp_sop(title: str, steps: str, roles: str, regulations: List[str]) ->
 
     QUALITY RULES
     - Do not invent specific batch numbers, equipment IDs, limits, dates, or names unless supplied.
-    - Use [TBD] for missing controlled values.
+    - Minimize [TBD] by using the user's supplied facts as draft targets, records, and controls; use [TBD] only for site-specific values that must be confirmed.
     - Write in formal SOP language with clear SHALL/MUST statements.
     - Make the procedure specific to the provided title and steps, not a generic SOP template.
     - Include practical QA checks and record evidence throughout.

@@ -32,6 +32,7 @@ export interface ComplianceCheck {
 
 export interface Document {
   id: string;
+  display_id?: string;
   name: string;
   type: "SOP" | "APQR" | "MBR" | "EBR" | "General";
   status: "Draft" | "Under_Review" | "Approved" | "Rejected";
@@ -40,6 +41,19 @@ export interface Document {
   file_size?: number;
   audit_trail: AuditTrailEvent[];
   compliance_check?: ComplianceCheck | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ControlBankDocument {
+  id: string;
+  display_id: string;
+  name: string;
+  type: "SOP" | "APQR";
+  status: "Draft" | "Under_Review" | "Approved" | "Rejected";
+  creator_name: string;
+  creator_staff_id: string;
+  file_size?: number;
   created_at: string;
   updated_at: string;
 }

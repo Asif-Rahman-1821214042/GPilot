@@ -6,14 +6,17 @@ import logging
 import re
 from io import BytesIO
 from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Request, Depends
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from jose import JWTError, jwt
 from pypdf import PdfReader
 
 # Import local database and gemini modules
 from app.database import init_db, get_db_connection
 from app.gemini import analyze_gxp_document, draft_gxp_sop, draft_gxp_apqr, answer_gxp_chat, get_compliance_audit_profile
+from app.auth import JWT_ALGORITHM, JWT_SECRET, get_current_user, get_user_by_id, router as auth_router
 
 class HealthCheckAccessLogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -32,6 +35,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router)
+
+@app.middleware("http")
+async def require_api_bearer_token(request: Request, call_next):
+    public_prefixes = ("/api/auth", "/api/health")
+    if request.method == "OPTIONS" or not request.url.path.startswith("/api") or request.url.path.startswith(public_prefixes):
+        return await call_next(request)
+
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return JSONResponse(status_code=401, content={"detail": "Missing bearer token"})
+
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = payload.get("sub")
+    except JWTError:
+        return JSONResponse(status_code=401, content={"detail": "Invalid token"})
+
+    if not user_id or not get_user_by_id(user_id):
+        return JSONResponse(status_code=401, content={"detail": "Invalid token"})
+
+    return await call_next(request)
 
 # Initialize DB on Startup
 @app.on_event("startup")
@@ -98,6 +125,44 @@ class ROIMetricCreate(BaseModel):
 class DocumentUpdate(BaseModel):
     content: str
 
+def build_display_id(doc_type: str) -> str:
+    normalized_type = (doc_type or "").upper()
+    if normalized_type == "SOP":
+        prefix = "SOP"
+    elif normalized_type == "APQR":
+        prefix = "APQR"
+    else:
+        prefix = "GXP"
+    return f"{prefix}-{datetime.utcnow().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+
+def serialize_document_row(row):
+    return {
+        "id": row["id"],
+        "display_id": row["display_id"] if "display_id" in row.keys() and row["display_id"] else row["id"],
+        "name": row["name"],
+        "type": row["type"],
+        "status": row["status"],
+        "content_type": row["content_type"],
+        "file_size": row["file_size"],
+        "audit_trail": json.loads(row["audit_trail"]) if row["audit_trail"] else [],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"]
+    }
+
+def serialize_control_bank_row(row):
+    return {
+        "id": row["id"],
+        "display_id": row["display_id"] if row["display_id"] else row["id"],
+        "name": row["name"],
+        "type": row["type"],
+        "status": row["status"],
+        "creator_name": row["creator_name"] or "Unknown User",
+        "creator_staff_id": row["creator_staff_id"] or "",
+        "file_size": row["file_size"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
 def parse_iso_datetime(value: str) -> Optional[datetime]:
     if not value:
         return None
@@ -144,36 +209,163 @@ def health_check():
 
 # Document Management API
 @app.get("/api/documents")
-def list_documents(type: Optional[str] = None):
+def list_documents(type: Optional[str] = None, current_user=Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
     if type:
-        cursor.execute("SELECT * FROM documents WHERE type = %s ORDER BY created_at DESC", (type,))
+        cursor.execute(
+            "SELECT * FROM documents WHERE type = %s AND owner_user_id = %s ORDER BY created_at DESC",
+            (type, current_user["id"])
+        )
     else:
-        cursor.execute("SELECT * FROM documents ORDER BY created_at DESC")
+        cursor.execute("SELECT * FROM documents WHERE owner_user_id = %s ORDER BY created_at DESC", (current_user["id"],))
     
     rows = cursor.fetchall()
-    documents = []
-    for r in rows:
-        documents.append({
-            "id": r["id"],
-            "name": r["name"],
-            "type": r["type"],
-            "status": r["status"],
-            "content_type": r["content_type"],
-            "file_size": r["file_size"],
-            "audit_trail": json.loads(r["audit_trail"]) if r["audit_trail"] else [],
-            "created_at": r["created_at"],
-            "updated_at": r["updated_at"]
-        })
+    documents = [serialize_document_row(r) for r in rows]
     conn.close()
     return documents
 
-@app.get("/api/documents/{document_id}")
-def get_document(document_id: str):
+@app.get("/api/control-bank/documents")
+def list_control_bank_documents(
+    doc_type: Optional[str] = None,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    current_user=Depends(get_current_user)
+):
+    clauses = ["d.type IN ('SOP', 'APQR')"]
+    params = []
+
+    if doc_type and doc_type.lower() != "all":
+        clauses.append("d.type = %s")
+        params.append(doc_type.upper())
+
+    if status and status.lower() != "all":
+        status_map = {
+            "accepted": "Approved",
+            "approved": "Approved",
+            "declined": "Rejected",
+            "rejected": "Rejected",
+            "draft": "Draft",
+            "under_review": "Under_Review",
+            "under-review": "Under_Review",
+        }
+        clauses.append("d.status = %s")
+        params.append(status_map.get(status.lower(), status))
+
+    if search:
+        like = f"%{search.lower()}%"
+        clauses.append("(LOWER(COALESCE(d.display_id, d.id)) LIKE %s OR LOWER(d.name) LIKE %s OR LOWER(COALESCE(u.name, '')) LIKE %s)")
+        params.extend([like, like, like])
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM documents WHERE id = %s", (document_id,))
+    cursor.execute(f"""
+        SELECT
+            d.id,
+            d.display_id,
+            d.name,
+            d.type,
+            d.status,
+            d.file_size,
+            d.created_at,
+            d.updated_at,
+            u.name AS creator_name,
+            u.staff_id AS creator_staff_id
+        FROM documents d
+        LEFT JOIN users u ON u.id = d.owner_user_id
+        WHERE {' AND '.join(clauses)}
+        ORDER BY d.created_at DESC
+        LIMIT 500
+    """, tuple(params))
+    rows = cursor.fetchall()
+    conn.close()
+    return [serialize_control_bank_row(row) for row in rows]
+
+@app.get("/api/control-bank/documents/{document_id}")
+def get_control_bank_document(document_id: str, current_user=Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT
+            d.*,
+            u.name AS creator_name,
+            u.staff_id AS creator_staff_id
+        FROM documents d
+        LEFT JOIN users u ON u.id = d.owner_user_id
+        WHERE d.id = %s AND d.type IN ('SOP', 'APQR')
+    """, (document_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    doc = {
+        "id": row["id"],
+        "display_id": row["display_id"] if "display_id" in row.keys() and row["display_id"] else row["id"],
+        "name": row["name"],
+        "type": row["type"],
+        "status": row["status"],
+        "content": recover_stored_pdf_text(row["name"], row["content"]),
+        "content_type": row["content_type"],
+        "file_size": row["file_size"],
+        "creator_name": row["creator_name"] or "Unknown User",
+        "creator_staff_id": row["creator_staff_id"] or "",
+        "audit_trail": json.loads(row["audit_trail"]) if row["audit_trail"] else [],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"]
+    }
+
+    desired_profile = get_compliance_audit_profile(row["type"], row["name"])["id"]
+    cursor.execute(
+        "SELECT * FROM compliance_checks WHERE document_id = %s AND profile = %s ORDER BY created_at DESC LIMIT 1",
+        (document_id, desired_profile)
+    )
+    chk_row = cursor.fetchone()
+    doc["compliance_check"] = None if not chk_row else row_to_compliance_check(chk_row)
+
+    conn.close()
+    return doc
+
+@app.post("/api/control-bank/documents/{document_id}/action")
+def update_control_bank_document_action(
+    document_id: str,
+    action: str = Form(...),
+    reviewer_name: str = Form("QA Lead"),
+    current_user=Depends(get_current_user)
+):
+    if action not in ["Approve", "Reject", "Submit_For_Review"]:
+        raise HTTPException(status_code=400, detail="Invalid action")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT status FROM documents WHERE id = %s AND type IN ('SOP', 'APQR')", (document_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    new_status = 'Approved' if action == 'Approve' else ('Rejected' if action == 'Reject' else 'Under_Review')
+    now_str = datetime.utcnow().isoformat()
+    cursor.execute(
+        "UPDATE documents SET status = %s, updated_at = %s WHERE id = %s",
+        (new_status, now_str, document_id)
+    )
+
+    signer = f"{reviewer_name} ({current_user['name']})"
+    event_text = f"Document status changed to {new_status} from SOP/APQR Control Bank by {signer} (21 CFR Part 11 compliant digital signature)"
+    add_audit_trail_event(cursor, document_id, event_text, signer)
+
+    conn.commit()
+    conn.close()
+
+    return {"id": document_id, "status": new_status, "audit_logged": True}
+
+@app.get("/api/documents/{document_id}")
+def get_document(document_id: str, current_user=Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM documents WHERE id = %s AND owner_user_id = %s", (document_id, current_user["id"]))
     row = cursor.fetchone()
     
     if not row:
@@ -182,6 +374,7 @@ def get_document(document_id: str):
         
     doc = {
         "id": row["id"],
+        "display_id": row["display_id"] if "display_id" in row.keys() and row["display_id"] else row["id"],
         "name": row["name"],
         "type": row["type"],
         "status": row["status"],
@@ -397,6 +590,7 @@ def recover_stored_pdf_text(filename: str, content: Optional[str]) -> str:
 async def upload_document(
     file: UploadFile = File(...),
     doc_type: str = Form("General"), # SOP, APQR, BatchRecord, Review
+    current_user=Depends(get_current_user),
 ):
     try:
         content_bytes = await file.read()
@@ -404,6 +598,7 @@ async def upload_document(
         content_text = extract_upload_text(file.filename, file.content_type, content_bytes)
             
         doc_id = f"doc-{uuid.uuid4().hex[:8]}"
+        display_id = build_display_id(doc_type)
         now_str = datetime.utcnow().isoformat()
         
         # Default empty audit trail
@@ -417,10 +612,10 @@ async def upload_document(
         cursor = conn.cursor()
         
         cursor.execute("""
-            INSERT INTO documents (id, name, type, status, content, content_type, file_size, audit_trail, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO documents (id, display_id, owner_user_id, name, type, status, content, content_type, file_size, audit_trail, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            doc_id, file.filename, doc_type, 'Under_Review', content_text, file.content_type, file_size, 
+            doc_id, display_id, current_user["id"], file.filename, doc_type, 'Under_Review', content_text, file.content_type, file_size, 
             json.dumps(audit_trail), now_str, now_str
         ))
         
@@ -429,15 +624,16 @@ async def upload_document(
         # Automatically log ROI metrics for this task
         # Reviewing manually takes 2 hours on average, AI does it instantly
         cursor.execute("""
-            INSERT INTO roi_metrics (task_type, hours_saved, errors_prevented, cost_saved_usd, created_at)
-            VALUES (%s, %s, %s, %s, %s)
-        """, ('General_Review' if doc_type == 'General' else 'Batch_Review', 2.5, len(compliance_check["anomalies"]), 125.0, now_str))
+            INSERT INTO roi_metrics (task_type, owner_user_id, hours_saved, errors_prevented, cost_saved_usd, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, ('General_Review' if doc_type == 'General' else 'Batch_Review', current_user["id"], 2.5, len(compliance_check["anomalies"]), 125.0, now_str))
         
         conn.commit()
         conn.close()
         
         return {
             "document_id": doc_id,
+            "display_id": display_id,
             "filename": file.filename,
             "type": doc_type,
             "compliance_score": compliance_check["score"],
@@ -449,11 +645,12 @@ async def upload_document(
 
 # SOP Drafting Endpoint
 @app.post("/api/documents/draft-sop")
-def generate_sop_draft(req: SOPDraftRequest):
+def generate_sop_draft(req: SOPDraftRequest, current_user=Depends(get_current_user)):
     try:
         draft_content = draft_gxp_sop(req.title, req.steps, req.roles, req.regulations)
         
         doc_id = f"sop-{uuid.uuid4().hex[:8]}"
+        display_id = build_display_id("SOP")
         filename = f"SOP_{req.title.replace(' ', '_')}_Draft.md"
         now_str = datetime.utcnow().isoformat()
         
@@ -467,34 +664,35 @@ def generate_sop_draft(req: SOPDraftRequest):
         cursor = conn.cursor()
         
         cursor.execute("""
-            INSERT INTO documents (id, name, type, status, content, content_type, file_size, audit_trail, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO documents (id, display_id, owner_user_id, name, type, status, content, content_type, file_size, audit_trail, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            doc_id, filename, 'SOP', 'Draft', draft_content, 'text/markdown', len(draft_content),
+            doc_id, display_id, current_user["id"], filename, 'SOP', 'Draft', draft_content, 'text/markdown', len(draft_content),
             json.dumps(audit_trail), now_str, now_str
         ))
         
         # Log ROI metric
         # Drafting an SOP manually takes about 16 hours, AI draft takes seconds
         cursor.execute("""
-            INSERT INTO roi_metrics (task_type, hours_saved, errors_prevented, cost_saved_usd, created_at)
-            VALUES (%s, %s, %s, %s, %s)
-        """, ('SOP_Prep', 16.0, 4, 800.0, now_str))
+            INSERT INTO roi_metrics (task_type, owner_user_id, hours_saved, errors_prevented, cost_saved_usd, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, ('SOP_Prep', current_user["id"], 16.0, 4, 800.0, now_str))
         
         conn.commit()
         conn.close()
         
-        return {"id": doc_id, "name": filename, "content": draft_content}
+        return {"id": doc_id, "display_id": display_id, "name": filename, "content": draft_content}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"SOP draft failed: {str(e)}")
 
 # APQR Compilation Endpoint
 @app.post("/api/documents/draft-apqr")
-def generate_apqr_draft(req: APQRDraftRequest):
+def generate_apqr_draft(req: APQRDraftRequest, current_user=Depends(get_current_user)):
     try:
         draft_content = draft_gxp_apqr(req.batch_summary, req.deviations, req.stability, req.quality_system_data)
         
         doc_id = f"apqr-{uuid.uuid4().hex[:8]}"
+        display_id = build_display_id("APQR")
         filename = "Annual_Product_Quality_Review_Draft.md"
         now_str = datetime.utcnow().isoformat()
         
@@ -508,37 +706,37 @@ def generate_apqr_draft(req: APQRDraftRequest):
         cursor = conn.cursor()
         
         cursor.execute("""
-            INSERT INTO documents (id, name, type, status, content, content_type, file_size, audit_trail, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO documents (id, display_id, owner_user_id, name, type, status, content, content_type, file_size, audit_trail, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            doc_id, filename, 'APQR', 'Draft', draft_content, 'text/markdown', len(draft_content),
+            doc_id, display_id, current_user["id"], filename, 'APQR', 'Draft', draft_content, 'text/markdown', len(draft_content),
             json.dumps(audit_trail), now_str, now_str
         ))
         
         # Log ROI metric
         # Compiling APQR takes about 40 hours manually
         cursor.execute("""
-            INSERT INTO roi_metrics (task_type, hours_saved, errors_prevented, cost_saved_usd, created_at)
-            VALUES (%s, %s, %s, %s, %s)
-        """, ('APQR_Gen', 40.0, 10, 2000.0, now_str))
+            INSERT INTO roi_metrics (task_type, owner_user_id, hours_saved, errors_prevented, cost_saved_usd, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, ('APQR_Gen', current_user["id"], 40.0, 10, 2000.0, now_str))
         
         conn.commit()
         conn.close()
         
-        return {"id": doc_id, "name": filename, "content": draft_content}
+        return {"id": doc_id, "display_id": display_id, "name": filename, "content": draft_content}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"APQR compilation failed: {str(e)}")
 
 # Approve or Reject document state (Part 11 audit trails compliance)
 @app.post("/api/documents/{document_id}/action")
-def update_document_action(document_id: str, action: str = Form(...), reviewer_name: str = Form("QA Lead")):
+def update_document_action(document_id: str, action: str = Form(...), reviewer_name: str = Form("QA Lead"), current_user=Depends(get_current_user)):
     if action not in ["Approve", "Reject", "Submit_For_Review"]:
         raise HTTPException(status_code=400, detail="Invalid action")
         
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    cursor.execute("SELECT status FROM documents WHERE id = %s", (document_id,))
+    cursor.execute("SELECT status FROM documents WHERE id = %s AND owner_user_id = %s", (document_id, current_user["id"]))
     row = cursor.fetchone()
     if not row:
         conn.close()
@@ -560,11 +758,11 @@ def update_document_action(document_id: str, action: str = Form(...), reviewer_n
     return {"id": document_id, "status": new_status, "audit_logged": True}
 
 @app.put("/api/documents/{document_id}")
-def update_document_content(document_id: str, req: DocumentUpdate):
+def update_document_content(document_id: str, req: DocumentUpdate, current_user=Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT * FROM documents WHERE id = %s FOR UPDATE", (document_id,))
+    cursor.execute("SELECT * FROM documents WHERE id = %s AND owner_user_id = %s FOR UPDATE", (document_id, current_user["id"]))
     row = cursor.fetchone()
     if not row:
         conn.close()
@@ -587,24 +785,27 @@ def update_document_content(document_id: str, req: DocumentUpdate):
 
     conn.commit()
     conn.close()
-    return get_document(document_id)
+    return get_document(document_id, current_user)
 
 @app.delete("/api/documents/{document_id}")
-def delete_document(document_id: str):
+def delete_document(document_id: str, current_user=Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM documents WHERE id = %s", (document_id,))
+    cursor.execute("DELETE FROM documents WHERE id = %s AND owner_user_id = %s", (document_id, current_user["id"]))
+    if cursor.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Document not found")
     cursor.execute("DELETE FROM compliance_checks WHERE document_id = %s", (document_id,))
     conn.commit()
     conn.close()
     return {"status": "success", "message": f"Document {document_id} and related reviews deleted successfully."}
 
 @app.post("/api/documents/{document_id}/scan")
-def scan_existing_document(document_id: str):
+def scan_existing_document(document_id: str, current_user=Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT * FROM documents WHERE id = %s FOR UPDATE", (document_id,))
+    cursor.execute("SELECT * FROM documents WHERE id = %s AND owner_user_id = %s FOR UPDATE", (document_id, current_user["id"]))
     doc_row = cursor.fetchone()
     if not doc_row:
         conn.close()
@@ -697,7 +898,7 @@ def clear_chat_history():
 
 # ROI & Savings Analytics API
 @app.get("/api/roi")
-def get_roi_summary():
+def get_roi_summary(current_user=Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -708,10 +909,11 @@ def get_roi_summary():
             SUM(cost_saved_usd) as total_usd,
             COUNT(*) as total_tasks
         FROM roi_metrics
-    """)
+        WHERE owner_user_id = %s
+    """, (current_user["id"],))
     summary = cursor.fetchone()
     
-    cursor.execute("SELECT * FROM roi_metrics ORDER BY created_at DESC LIMIT 50")
+    cursor.execute("SELECT * FROM roi_metrics WHERE owner_user_id = %s ORDER BY created_at DESC LIMIT 50", (current_user["id"],))
     rows = cursor.fetchall()
     
     metrics_list = []
@@ -739,16 +941,17 @@ def get_roi_summary():
     }
 
 @app.get("/api/dashboard/metrics")
-def get_dashboard_metrics():
+def get_dashboard_metrics(current_user=Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT DISTINCT ON (document_id) *
-        FROM compliance_checks
-        WHERE document_id IS NOT NULL
-        ORDER BY document_id, created_at DESC
-    """)
+        SELECT DISTINCT ON (cc.document_id) cc.*
+        FROM compliance_checks cc
+        JOIN documents d ON d.id = cc.document_id
+        WHERE cc.document_id IS NOT NULL AND d.owner_user_id = %s
+        ORDER BY cc.document_id, cc.created_at DESC
+    """, (current_user["id"],))
     latest_checks = cursor.fetchall()
 
     scores = [float(row["score"]) for row in latest_checks if row["score"] is not None]
@@ -785,10 +988,14 @@ def get_dashboard_metrics():
             COALESCE(SUM(cost_saved_usd), 0) AS total_usd,
             COUNT(*) AS total_tasks
         FROM roi_metrics
-    """)
+        WHERE owner_user_id = %s
+    """, (current_user["id"],))
     roi_summary = cursor.fetchone()
 
-    cursor.execute("SELECT id, name, type, status, content, created_at FROM documents ORDER BY created_at ASC")
+    cursor.execute(
+        "SELECT id, name, type, status, content, created_at FROM documents WHERE owner_user_id = %s ORDER BY created_at ASC",
+        (current_user["id"],)
+    )
     documents = cursor.fetchall()
 
     yield_values = []
@@ -840,14 +1047,14 @@ def get_dashboard_metrics():
     }
 
 @app.post("/api/roi")
-def create_roi_metric(req: ROIMetricCreate):
+def create_roi_metric(req: ROIMetricCreate, current_user=Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
     now_str = datetime.utcnow().isoformat()
     cursor.execute("""
-        INSERT INTO roi_metrics (task_type, hours_saved, errors_prevented, cost_saved_usd, created_at)
-        VALUES (%s, %s, %s, %s, %s)
-    """, (req.task_type, req.hours_saved, req.errors_prevented, req.cost_saved_usd, now_str))
+        INSERT INTO roi_metrics (task_type, owner_user_id, hours_saved, errors_prevented, cost_saved_usd, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    """, (req.task_type, current_user["id"], req.hours_saved, req.errors_prevented, req.cost_saved_usd, now_str))
     conn.commit()
     conn.close()
     return {"status": "success"}

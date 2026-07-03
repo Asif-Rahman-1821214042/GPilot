@@ -165,6 +165,7 @@ Accelerated stability studies at 40°C/75% RH for Batch 94812 showed a sudden dr
   };
 
   const filteredDocs = documents.filter(doc => 
+    (doc.display_id || doc.id).toLowerCase().includes(searchQuery.toLowerCase()) ||
     doc.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
     doc.type.toLowerCase().includes(searchQuery.toLowerCase()) ||
     doc.status.toLowerCase().includes(searchQuery.toLowerCase())
@@ -558,7 +559,7 @@ Accelerated stability studies at 40°C/75% RH for Batch 94812 showed a sudden dr
                 <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-slate-400" />
                 <input
                   type="text"
-                  placeholder="Filter by name, class, status..."
+                  placeholder="Filter by ID, name, class, status..."
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   className="w-48 pl-9 pr-3 py-1.5 text-xs bg-white border border-slate-200 rounded-lg focus:outline-none focus:border-blue-500 transition-colors"
@@ -599,6 +600,9 @@ Accelerated stability studies at 40°C/75% RH for Batch 94812 showed a sudden dr
                           {doc.name}
                         </h4>
                         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1 text-[10px] text-slate-500 font-mono">
+                          <span className="font-black text-blue-700 bg-blue-50 border border-blue-100 px-1.5 py-0.5 rounded">
+                            {doc.display_id || doc.id}
+                          </span>
                           <span className="font-extrabold px-1.5 py-0.5 bg-slate-150/60 rounded text-slate-700 uppercase tracking-wider text-[9px]">
                             {doc.type}
                           </span>

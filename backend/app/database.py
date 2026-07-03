@@ -29,11 +29,15 @@ def init_db():
             content TEXT,
             content_type TEXT,
             file_size INTEGER,
+            display_id TEXT,
+            owner_user_id TEXT,
             audit_trail TEXT, -- JSON array of events
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
     """)
+    cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS display_id TEXT")
+    cursor.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS owner_user_id TEXT")
     
     # Create compliance_checks table
     cursor.execute("""
@@ -51,6 +55,18 @@ def init_db():
         )
     """)
     cursor.execute("ALTER TABLE compliance_checks ADD COLUMN IF NOT EXISTS profile TEXT")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            staff_id TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            designation TEXT NOT NULL,
+            type TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    """)
     
     # Create chat_history table
     cursor.execute("""
@@ -67,12 +83,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS roi_metrics (
             id SERIAL PRIMARY KEY,
             task_type TEXT NOT NULL, -- 'SOP_Prep', 'APQR_Gen', 'Batch_Review', 'General_Review'
+            owner_user_id TEXT,
             hours_saved REAL NOT NULL,
             errors_prevented INTEGER NOT NULL,
             cost_saved_usd REAL NOT NULL,
             created_at TEXT NOT NULL
         )
     """)
+    cursor.execute("ALTER TABLE roi_metrics ADD COLUMN IF NOT EXISTS owner_user_id TEXT")
     
     # Insert some initial mock ROI data if table is empty to show beautiful analytics
     cursor.execute("SELECT COUNT(*) FROM roi_metrics")

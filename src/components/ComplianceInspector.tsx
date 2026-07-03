@@ -13,12 +13,20 @@ interface ComplianceInspectorProps {
   document: Document;
   onBack: () => void;
   onActionComplete: () => void;
+  readOnly?: boolean;
+  backLabel?: string;
+  allowReviewActions?: boolean;
+  actionBasePath?: string;
 }
 
 export default function ComplianceInspector({ 
   document: initialDoc, 
   onBack, 
-  onActionComplete 
+  onActionComplete,
+  readOnly = false,
+  backLabel = "Back to Document Desk",
+  allowReviewActions = false,
+  actionBasePath = "/api/documents",
 }: ComplianceInspectorProps) {
   const [currentDoc, setCurrentDoc] = useState(initialDoc);
   const [reviewerName, setReviewerName] = useState("");
@@ -40,7 +48,7 @@ export default function ComplianceInspector({
   }, [initialDoc]);
 
   useEffect(() => {
-    if (isEditingContent) return;
+    if (readOnly || isEditingContent) return;
     if (currentDoc.compliance_check || isScanning) return;
     if (requestedScanForRef.current === currentDoc.id) return;
 
@@ -71,7 +79,7 @@ export default function ComplianceInspector({
     };
 
     runMissingScan();
-  }, [currentDoc.id, currentDoc.compliance_check, isEditingContent, isScanning, onActionComplete]);
+  }, [currentDoc.id, currentDoc.compliance_check, isEditingContent, isScanning, onActionComplete, readOnly]);
 
   const finalizeEditedContent = useCallback(async (content: string) => {
     requestedScanForRef.current = currentDoc.id;
@@ -126,7 +134,7 @@ export default function ComplianceInspector({
     formData.append("reviewer_name", reviewerName);
 
     try {
-      const response = await fetch(`/api/documents/${currentDoc.id}/action`, {
+      const response = await fetch(`${actionBasePath}/${currentDoc.id}/action`, {
         method: "POST",
         body: formData
       });
@@ -135,6 +143,11 @@ export default function ComplianceInspector({
         throw new Error("Action signature failed");
       }
 
+      const result = await response.json();
+      setCurrentDoc((prev) => ({
+        ...prev,
+        status: result.status || prev.status,
+      }));
       onActionComplete();
     } catch (err) {
       console.error(err);
@@ -182,7 +195,7 @@ export default function ComplianceInspector({
         className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-500 hover:text-blue-600 transition-colors cursor-pointer"
       >
         <ArrowLeft className="h-3.5 w-3.5" />
-        Back to Document Desk
+        {backLabel}
       </button>
 
       {/* Doc Header Detail */}
@@ -339,7 +352,7 @@ export default function ComplianceInspector({
         {/* Right Column: Part 11 Signature & Audit Trails */}
         <div className="space-y-6">
           {/* Part 11 Electronic Signature Box */}
-          {doc.status !== "Approved" && doc.status !== "Rejected" && (
+          {allowReviewActions && doc.status !== "Approved" && doc.status !== "Rejected" && (
             <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-xs relative overflow-hidden">
               <div className="absolute right-0 top-0 translate-x-4 -translate-y-4 opacity-5">
                 <Lock className="h-24 w-24 text-slate-800" />
@@ -427,7 +440,7 @@ export default function ComplianceInspector({
               <FileText className="h-4 w-4 text-blue-600" />
               Document PDF Preview
             </h3>
-            {canEditDocument && !isEditingContent && (
+            {!readOnly && canEditDocument && !isEditingContent && (
               <button
                 type="button"
                 onClick={() => {
@@ -443,7 +456,7 @@ export default function ComplianceInspector({
             )}
           </div>
 
-          {isEditingContent && canEditDocument && (
+          {!readOnly && isEditingContent && canEditDocument && (
               <SectionWiseDocumentEditor
                 documentId={doc.id}
               docType={doc.type}
