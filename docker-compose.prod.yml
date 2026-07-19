@@ -1,5 +1,6 @@
 services:
   frontend:
+    restart: unless-stopped
     build:
       context: .
       dockerfile: Dockerfile.frontend
@@ -9,12 +10,13 @@ services:
     environment:
       VITE_API_TARGET: http://backend:8000
     ports:
-      - "3000:5173"
+      - "3009:5173"
     depends_on:
       backend:
         condition: service_healthy
 
   backend:
+    restart: unless-stopped
     build:
       context: ./backend
     container_name: gxpilot-backend
@@ -39,6 +41,7 @@ services:
       start_period: 15s
 
   pgdb:
+    restart: unless-stopped
     image: postgres:16-alpine
     container_name: gxpilot-pgdb
     environment:
@@ -56,6 +59,7 @@ services:
       retries: 5
 
   pgadmin:
+    restart: unless-stopped
     image: dpage/pgadmin4:8
     container_name: gxpilot-pgadmin
     environment:
